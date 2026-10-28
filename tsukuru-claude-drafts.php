@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Tsukuru Claude Drafts
  * Description:       Claude（MCP Adapter経由）から記事の下書きを作成・更新するためのアビリティを登録します。公開はできません。
- * Version:           1.0.0
+ * Version:           1.1.0
  * Requires at least: 6.9
  * Requires PHP:      7.4
  * Author:            やまはる
@@ -14,15 +14,23 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+define( 'TSUKURU_CLAUDE_DRAFTS_VERSION', '1.1.0' );
+
+/** リライト元の投稿IDを記録するメタキー（_ 始まりなのでカスタムフィールド欄には表示されない） */
+define( 'TSUKURU_CLAUDE_DRAFTS_REWRITE_META', '_tsukuru_rewrite_of' );
+
 /*
- * このプラグインでできること（すべて「下書き」止まり）
- * - tsukuru/create-draft    … 新しい下書きを作成
- * - tsukuru/update-draft    … 下書き・レビュー待ちの記事を更新
- * - tsukuru/list-drafts     … 自分の下書き一覧を取得
- * - tsukuru/list-categories … カテゴリ一覧を取得
+ * このプラグインでできること（公開記事は読むだけ。書き込みはすべて「下書き」止まり）
+ * - tsukuru/create-draft         … 新しい下書きを作成
+ * - tsukuru/update-draft         … 下書き・レビュー待ちの記事を更新
+ * - tsukuru/list-drafts          … 自分の下書き一覧を取得
+ * - tsukuru/list-categories      … カテゴリ一覧を取得
+ * - tsukuru/get-post             … 記事の本文をブロック形式で取得（v1.1.0〜）
+ * - tsukuru/create-rewrite-draft … 公開記事をもとにリライト用の下書きを作成（v1.1.0〜）
  *
- * 公開・予約投稿・削除はできない設計です。
+ * 公開・予約投稿・削除、公開済み記事の書き換えはできない設計です。
  * 必要な権限は edit_posts（寄稿者以上）。Claude用ユーザーは「寄稿者」推奨。
+ * 変更履歴は CHANGELOG.md を参照してください。
  */
 
 /**
@@ -66,10 +74,14 @@ add_action(
 		$post_output_schema = array(
 			'type'       => 'object',
 			'properties' => array(
-				'id'       => array( 'type' => 'integer' ),
-				'title'    => array( 'type' => 'string' ),
-				'status'   => array( 'type' => 'string' ),
-				'edit_url' => array( 'type' => 'string' ),
+				'id'         => array( 'type' => 'integer' ),
+				'title'      => array( 'type' => 'string' ),
+				'status'     => array( 'type' => 'string' ),
+				'edit_url'   => array( 'type' => 'string' ),
+				'rewrite_of' => array(
+					'type'        => 'integer',
+					'description' => 'リライト用の下書きの場合、リライト元の投稿ID（v1.1.0〜）',
+				),
 			),
 		);
 
@@ -214,6 +226,105 @@ add_action(
 				),
 			)
 		);
+
+		// 5. 記事を読む（v1.1.0〜）
+		wp_register_ability(
+			'tsukuru/get-post',
+			array(
+				'label'               => '記事を読む',
+				'description'         => '投稿の本文をブロックエディタ形式（ブロックコメント付きHTML）のまま返します。公開記事のほか、このユーザーが編集できる下書きも読めます。id か slug のどちらかを指定してください。リライトの前に現在の内容を確認するときに使います。',
+				'category'            => 'tsukuru-drafts',
+				'input_schema'        => array(
+					'type'       => 'object',
+					'properties' => array(
+						'id'   => array(
+							'type'        => 'integer',
+							'description' => '投稿ID',
+						),
+						'slug' => array(
+							'type'        => 'string',
+							'description' => 'スラッグ（URLの末尾部分）',
+						),
+					),
+				),
+				'output_schema'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'id'         => array( 'type' => 'integer' ),
+						'title'      => array( 'type' => 'string' ),
+						'status'     => array( 'type' => 'string' ),
+						'slug'       => array( 'type' => 'string' ),
+						'link'       => array( 'type' => 'string' ),
+						'date'       => array( 'type' => 'string' ),
+						'modified'   => array( 'type' => 'string' ),
+						'excerpt'    => array( 'type' => 'string' ),
+						'categories' => array(
+							'type'  => 'array',
+							'items' => array( 'type' => 'string' ),
+						),
+						'tags'       => array(
+							'type'  => 'array',
+							'items' => array( 'type' => 'string' ),
+						),
+						'content'    => array( 'type' => 'string' ),
+						'rewrite_of' => array( 'type' => 'integer' ),
+					),
+				),
+				'permission_callback' => $can_edit,
+				'execute_callback'    => 'tsukuru_claude_drafts_get_post',
+				'meta'                => array_merge(
+					$meta,
+					array( 'annotations' => array( 'readonly' => true ) )
+				),
+			)
+		);
+
+		// 6. リライト用の下書きを作成（v1.1.0〜）
+		wp_register_ability(
+			'tsukuru/create-rewrite-draft',
+			array(
+				'label'               => 'リライト用の下書きを作成',
+				'description'         => '公開中の記事をもとに、リライト用の新しい下書きを作成します。元の記事は一切変更しません。content を省略すると元の本文をそのままコピーし、指定するとその内容で作成します（ブロックエディタ形式）。カテゴリとタグは元の記事から引き継ぎます。作成後は tsukuru/update-draft で続けて編集できます。',
+				'category'            => 'tsukuru-drafts',
+				'input_schema'        => array(
+					'type'       => 'object',
+					'required'   => array( 'source_id' ),
+					'properties' => array(
+						'source_id' => array(
+							'type'        => 'integer',
+							'description' => 'リライト元の公開記事のID',
+						),
+						'title'     => array(
+							'type'        => 'string',
+							'description' => '下書きのタイトル（省略時は「【リライト】元のタイトル」）',
+						),
+						'content'   => array(
+							'type'        => 'string',
+							'description' => 'リライト後の本文（省略時は元の本文をコピー）',
+						),
+						'excerpt'   => array(
+							'type'        => 'string',
+							'description' => '抜粋（省略時は元の抜粋をコピー）',
+						),
+					),
+				),
+				'output_schema'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'id'              => array( 'type' => 'integer' ),
+						'title'           => array( 'type' => 'string' ),
+						'status'          => array( 'type' => 'string' ),
+						'edit_url'        => array( 'type' => 'string' ),
+						'rewrite_of'      => array( 'type' => 'integer' ),
+						'source_link'     => array( 'type' => 'string' ),
+						'source_edit_url' => array( 'type' => 'string' ),
+					),
+				),
+				'permission_callback' => $can_edit,
+				'execute_callback'    => 'tsukuru_claude_drafts_create_rewrite',
+				'meta'                => $meta,
+			)
+		);
 	}
 );
 
@@ -278,12 +389,142 @@ function tsukuru_claude_drafts_build_postarr( $input ) {
  */
 function tsukuru_claude_drafts_format( $post_id ) {
 	$post = get_post( $post_id );
-	return array(
+	$data = array(
 		'id'       => (int) $post->ID,
 		'title'    => $post->post_title,
 		'status'   => $post->post_status,
 		'edit_url' => admin_url( 'post.php?post=' . $post->ID . '&action=edit' ),
 	);
+
+	// v1.1.0〜：リライト用の下書きなら、リライト元のIDも返す
+	$rewrite_of = (int) get_post_meta( $post->ID, TSUKURU_CLAUDE_DRAFTS_REWRITE_META, true );
+	if ( $rewrite_of ) {
+		$data['rewrite_of'] = $rewrite_of;
+	}
+	return $data;
+}
+
+/**
+ * このユーザーが本文を読んでよい投稿か（v1.1.0〜）
+ *
+ * 公開中でパスワード保護のない記事は誰でも読めるので許可。
+ * それ以外（下書き・非公開・パスワード保護）は編集権限がある場合のみ許可。
+ *
+ * @param WP_Post $post 投稿。
+ * @return bool
+ */
+function tsukuru_claude_drafts_can_read( $post ) {
+	if ( 'publish' === $post->post_status && '' === $post->post_password ) {
+		return true;
+	}
+	return current_user_can( 'edit_post', $post->ID );
+}
+
+/**
+ * 記事を読む（v1.1.0〜）
+ *
+ * @param array $input 入力値。
+ * @return array|WP_Error
+ */
+function tsukuru_claude_drafts_get_post( $input = array() ) {
+	$input = (array) $input;
+	$post  = null;
+
+	if ( ! empty( $input['id'] ) ) {
+		$post = get_post( (int) $input['id'] );
+	} elseif ( ! empty( $input['slug'] ) ) {
+		$found = get_posts(
+			array(
+				'name'           => sanitize_title( $input['slug'] ),
+				'post_type'      => 'post',
+				'post_status'    => array( 'publish', 'draft', 'pending', 'private' ),
+				'posts_per_page' => 1,
+			)
+		);
+		$post  = $found ? $found[0] : null;
+	} else {
+		return new WP_Error( 'missing_param', 'id か slug のどちらかを指定してください。' );
+	}
+
+	if ( ! $post || 'post' !== $post->post_type ) {
+		return new WP_Error( 'not_found', '指定された投稿が見つかりません。' );
+	}
+	if ( ! tsukuru_claude_drafts_can_read( $post ) ) {
+		return new WP_Error( 'forbidden', 'この投稿を読む権限がありません。' );
+	}
+
+	$data = array(
+		'id'         => (int) $post->ID,
+		'title'      => $post->post_title,
+		'status'     => $post->post_status,
+		'slug'       => $post->post_name,
+		'link'       => get_permalink( $post ),
+		'date'       => get_post_time( 'c', false, $post ),
+		'modified'   => get_post_modified_time( 'c', false, $post ),
+		'excerpt'    => $post->post_excerpt,
+		'categories' => wp_get_post_categories( $post->ID, array( 'fields' => 'names' ) ),
+		'tags'       => wp_get_post_tags( $post->ID, array( 'fields' => 'names' ) ),
+		'content'    => $post->post_content,
+	);
+
+	$rewrite_of = (int) get_post_meta( $post->ID, TSUKURU_CLAUDE_DRAFTS_REWRITE_META, true );
+	if ( $rewrite_of ) {
+		$data['rewrite_of'] = $rewrite_of;
+	}
+	return $data;
+}
+
+/**
+ * リライト用の下書きを作成（v1.1.0〜）
+ *
+ * 元の記事は変更せず、新しい下書きとして保存する。
+ *
+ * @param array $input 入力値。
+ * @return array|WP_Error
+ */
+function tsukuru_claude_drafts_create_rewrite( $input = array() ) {
+	$input     = (array) $input;
+	$source_id = isset( $input['source_id'] ) ? (int) $input['source_id'] : 0;
+	$source    = get_post( $source_id );
+
+	if ( ! $source || 'post' !== $source->post_type ) {
+		return new WP_Error( 'not_found', 'リライト元の投稿が見つかりません。' );
+	}
+	if ( 'publish' !== $source->post_status ) {
+		return new WP_Error( 'not_published', 'リライト元には公開中の記事を指定してください。下書きは tsukuru/update-draft で直接編集できます。' );
+	}
+	if ( ! tsukuru_claude_drafts_can_read( $source ) ) {
+		return new WP_Error( 'forbidden', 'この投稿を読む権限がありません。' );
+	}
+
+	$postarr = array(
+		'post_type'     => 'post',
+		'post_status'   => 'draft', // 常に下書き固定
+		'post_author'   => get_current_user_id(),
+		'post_title'    => isset( $input['title'] )
+			? sanitize_text_field( $input['title'] )
+			: '【リライト】' . $source->post_title,
+		'post_content'  => isset( $input['content'] ) ? (string) $input['content'] : $source->post_content,
+		'post_excerpt'  => isset( $input['excerpt'] )
+			? sanitize_textarea_field( $input['excerpt'] )
+			: $source->post_excerpt,
+		'post_category' => wp_get_post_categories( $source->ID ),
+		'tags_input'    => wp_get_post_tags( $source->ID, array( 'fields' => 'names' ) ),
+		'meta_input'    => array(
+			TSUKURU_CLAUDE_DRAFTS_REWRITE_META => $source->ID,
+		),
+	);
+
+	$post_id = wp_insert_post( wp_slash( $postarr ), true );
+	if ( is_wp_error( $post_id ) ) {
+		return $post_id;
+	}
+
+	$data                    = tsukuru_claude_drafts_format( $post_id );
+	$data['rewrite_of']      = (int) $source->ID;
+	$data['source_link']     = get_permalink( $source );
+	$data['source_edit_url'] = admin_url( 'post.php?post=' . $source->ID . '&action=edit' );
+	return $data;
 }
 
 /**
